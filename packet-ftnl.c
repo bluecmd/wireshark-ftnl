@@ -18,6 +18,7 @@
 #include <epan/exceptions.h>
 #include <epan/prefs.h>
 #include <epan/expert.h>
+#include "packet-fc.h"
 #include "packet-tcp.h"
 
 void proto_register_ftnl(void);
@@ -37,16 +38,27 @@ static dissector_handle_t fc_handle;
 static int
 dissect_ftnl_pdu(tvbuff_t *tvb, packet_info *pinfo _U_, proto_tree *tree _U_, void *data _U_)
 {
+  guint8 version;
   guint32 offset = 0;
   guint32 pdulen;
 
   col_set_str(pinfo->cinfo, COL_PROTOCOL, "FTNL");
   col_clear(pinfo->cinfo, COL_INFO);
 
+  version = tvb_get_guint8 (tvb, 4);
   pdulen = tvb_get_ntohs (tvb, 6);
   proto_item *ti = proto_tree_add_item(tree, proto_ftnl, tvb, 0, pdulen, ENC_NA);
   proto_tree *ftnl_tree = proto_item_add_subtree(ti, ett_ftnl);
+  // TODO remove
   ftnl_tree++;
+
+  if (version == 24) {
+    tvbuff_t *next_tvb;
+    fc_data_t fc_data;
+    fc_data.sof_eof = 0;
+    next_tvb = tvb_new_subset_remaining (tvb, 24+0x28);
+    call_dissector_with_data(fc_handle, next_tvb, pinfo, tree, &fc_data);
+  }
  
   offset += pdulen;
   return offset;
