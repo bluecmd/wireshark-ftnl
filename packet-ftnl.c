@@ -376,7 +376,7 @@ dissect_ftnl_handle(tvbuff_t *tvb, packet_info *pinfo, proto_tree *tree, void* d
   gint bytes_remaining = tvb_captured_length (tvb);
   guint32 marker;
 
-  if (bytes_remaining < 20) {
+  if (bytes_remaining < 4) {
     return FALSE;
   }
 
