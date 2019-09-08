@@ -39,12 +39,24 @@ static int hf_ftnl_cmd_bind_req = -1;
 static int hf_ftnl_cmd_bind_resp = -1;
 static int hf_ftnl_cmd_keepalive = -1;
 static int hf_ftnl_cmd_window = -1;
+static int hf_ftnl_data = -1;
+static int hf_ftnl_data_marker = -1;
+static int hf_ftnl_data_frame_cnt = -1;
+static int hf_ftnl_data_unknown1 = -1;
+static int hf_ftnl_data_frame_len = -1;
+static int hf_ftnl_data_batch_len1 = -1;
+static int hf_ftnl_data_batch_len2 = -1;
+static int hf_ftnl_data_batch_header = -1;
+static int hf_ftnl_data_wire_header = -1;
+static int hf_ftnl_data_inner_crc = -1;
+static int hf_ftnl_data_inner_crc_status = -1;
 
 static gint ett_ftnl = -1;
 
 static expert_field ei_ftnl_cmd_unknown = EI_INIT;
 static expert_field ei_ftnl_wrong_hdr_crc = EI_INIT;
 static expert_field ei_ftnl_wrong_data_crc = EI_INIT;
+static expert_field ei_ftnl_wrong_inner_data_crc = EI_INIT;
 
 static dissector_handle_t ftnl_handle;
 static dissector_handle_t fc_handle;
@@ -110,9 +122,72 @@ crc16_ftnl_tvb_offset(tvbuff_t *tvb, guint offset, guint len)
   return crc16_reflected(buf, len, 0xffff, crc16_precompiled_A001);
 }
 
+// Max size is 14 static header, 15 frame sizes, 2 byte crc, and 2 byte align
+#define MAX_DATA_HEADER_SIZE (14+2*15+2+2)
+
+static int
+dissect_ftnl_data(tvbuff_t *tvb, packet_info *pinfo, proto_tree *tree)
+{
+  proto_item *ti;
+  guint32 offset = 0;
+  guint32 cnt = 0;
+  guint32 lens[15];
+#if 0
+  guint8 hdrnocrc[MAX_DATA_HEADER_SIZE];
+  guint16 crc;
+#endif
+  tvbuff_t *next_tvb;
+  col_append_str(pinfo->cinfo, COL_INFO, "Data");
+  ti = proto_tree_add_item(tree, hf_ftnl_data, tvb, 0, -1, ENC_NA);
+  tree = proto_item_add_subtree(ti, ett_ftnl);
+
+  proto_tree_add_item(tree, hf_ftnl_data_marker, tvb, 0, 4, ENC_BIG_ENDIAN);
+  proto_tree_add_item_ret_uint(tree, hf_ftnl_data_frame_cnt, tvb, 4, 1, ENC_BIG_ENDIAN, &cnt);
+  proto_tree_add_item(tree, hf_ftnl_data_unknown1, tvb, 4, 10, ENC_BIG_ENDIAN);
+  offset += 14;
+  for (guint32 i = 0; i < cnt; i++) {
+    proto_tree_add_item_ret_uint(tree, hf_ftnl_data_frame_len, tvb, offset, 2, ENC_BIG_ENDIAN, &lens[i]);
+    offset += 2;
+  }
+
+#if 0
+  tvb_memcpy(tvb, hdrnocrc, 0, offset+4);
+  memset(hdrnocrc + offset, 0, 2);
+  crc = crc16_reflected(hdrnocrc, offset+4, 0xffff, crc16_precompiled_A001);
+#endif
+  proto_tree_add_checksum(tree, tvb, offset, hf_ftnl_data_inner_crc,
+      hf_ftnl_data_inner_crc_status, &ei_ftnl_wrong_inner_data_crc, pinfo,
+      /*crc*/ 0, ENC_BIG_ENDIAN, PROTO_CHECKSUM_VERIFY);
+  offset += 2;
+  if (cnt % 2 == 1) {
+    // Align to 4 bytes
+    offset += 2;
+  }
+
+  // Four types of known data type:
+  // E - One frame
+  // F
+  // H
+  // K - Batched
+  //guint8 variant = tvb_get_guint8(tvb, 3);
+
+  for (guint32 i = 0; i < cnt; i++) {
+    proto_tree *f_tree = proto_item_add_subtree(ti, ett_ftnl);
+    proto_tree_add_item(f_tree, hf_ftnl_data_wire_header, tvb, offset, 0x14, ENC_BIG_ENDIAN);
+    offset += 0x14;
+    fc_data_t fc_data;
+    fc_data.sof_eof = 0;
+    guint32 fclen = lens[i] - 0x14;
+    next_tvb = tvb_new_subset_length(tvb, offset, fclen);
+    call_dissector_with_data(fc_handle, next_tvb, pinfo, f_tree, &fc_data);
+    offset += fclen;
+  }
+  return offset;
+}
+
 /* This method dissects fully reassembled messages */
 static int
-dissect_ftnl_pdu(tvbuff_t *tvb, packet_info *pinfo _U_, proto_tree *tree _U_, void *data _U_)
+dissect_ftnl_pdu(tvbuff_t *tvb, packet_info *pinfo, proto_tree *tree, void *data _U_)
 {
   guint32 hdrlen = 0;
   guint32 offset = 0;
@@ -158,8 +233,7 @@ dissect_ftnl_pdu(tvbuff_t *tvb, packet_info *pinfo _U_, proto_tree *tree _U_, vo
     dissector_handle_t cmd_handle = dissector_get_uint_handle(ftnl_cmd_table, cmd);
     if (cmd_handle != NULL) {
       proto_tree *cmd_tree = proto_item_add_subtree(ti, ett_ftnl);
-      tvbuff_t *tvb_cmd;
-      tvb_cmd = tvb_new_subset_length(tvb, offset, pdulen - offset);
+      tvbuff_t *tvb_cmd = tvb_new_subset_length(tvb, offset, pdulen - offset);
       offset += call_dissector(cmd_handle, tvb_cmd, pinfo, cmd_tree);
     } else {
       col_append_sep_str(pinfo->cinfo, COL_INFO, ", ", "[unknown command]");
@@ -168,19 +242,9 @@ dissect_ftnl_pdu(tvbuff_t *tvb, packet_info *pinfo _U_, proto_tree *tree _U_, vo
   }
 
   if (hdrlen == 24) {
-    tvbuff_t *next_tvb;
-    // For some reason the 4th character in the marker is an indicator of
-    // if we need to skip further ahead
-    guint8 variant = tvb_get_guint8(tvb, 4 + 3);
-    if (variant == 'K') {
-      offset += 0x40;
-    } else {
-      offset += 0x28;
-    }
-    fc_data_t fc_data;
-    fc_data.sof_eof = 0;
-    next_tvb = tvb_new_subset_remaining (tvb, offset);
-    call_dissector_with_data(fc_handle, next_tvb, pinfo, tree, &fc_data);
+    proto_tree *data_tree = proto_item_add_subtree(ti, ett_ftnl);
+    tvbuff_t *tvb_data = tvb_new_subset_remaining(tvb, offset);
+    dissect_ftnl_data(tvb_data, pinfo, data_tree);
   }
  
   offset += pdulen;
@@ -195,7 +259,7 @@ get_ftnl_pdu_len(packet_info *pinfo _U_, tvbuff_t *tvb, int offset, void *data _
 
 /* Handle TCP segment reassembly for messages/PDUs */
 static int
-dissect_ftnl(tvbuff_t *tvb _U_, packet_info *pinfo, proto_tree *tree _U_, void* data _U_)
+dissect_ftnl(tvbuff_t *tvb, packet_info *pinfo, proto_tree *tree, void* data _U_)
 {
   tcp_dissect_pdus(tvb, pinfo, tree, TRUE, MINIMAL_FRAME_HEADER_LEN,
       get_ftnl_pdu_len, dissect_ftnl_pdu, data);
@@ -251,6 +315,36 @@ proto_register_ftnl(void)
     { &hf_ftnl_cmd_window,
       { "Window Update", "ftnl.window", FT_NONE, BASE_NONE, NULL, 0x0, NULL, HFILL }
     },
+    { &hf_ftnl_data,
+      { "Data", "ftnl.data", FT_NONE, BASE_NONE, NULL, 0x0, NULL, HFILL }
+    },
+    { &hf_ftnl_data_marker,
+      { "Marker", "ftnl.data.marker", FT_STRING, BASE_NONE, NULL, 0x0, NULL, HFILL }
+    },
+    { &hf_ftnl_data_frame_cnt,
+      { "No. of frames", "ftnl.data.cnt", FT_UINT8, BASE_DEC, NULL, 0xF0, NULL, HFILL }
+    },
+    { &hf_ftnl_data_unknown1,
+      { "Unknown1", "ftnl.data.unknown1", FT_BYTES, SEP_SPACE, NULL, 0x0, NULL, HFILL }
+    },
+    { &hf_ftnl_data_batch_len1,
+      { "Batch Length #1", "ftnl.data.blen1", FT_UINT16, BASE_DEC, NULL, 0x0, NULL, HFILL }
+    },
+    { &hf_ftnl_data_batch_len2,
+      { "Batch Length #2", "ftnl.data.blen2", FT_UINT16, BASE_DEC, NULL, 0x0, NULL, HFILL }
+    },
+    { &hf_ftnl_data_batch_header,
+      { "Batch Header", "ftnl.data.bhdr", FT_BYTES, SEP_SPACE, NULL, 0x0, NULL, HFILL }
+    },
+    { &hf_ftnl_data_wire_header,
+      { "FC Wire Header", "ftnl.data.wirehdr", FT_BYTES, SEP_SPACE, NULL, 0x0, NULL, HFILL }
+    },
+    { &hf_ftnl_data_frame_len,
+      { "Frame Length", "ftnl.data.framelen", FT_UINT16, BASE_DEC, NULL, 0x0, NULL, HFILL }
+    },
+    { &hf_ftnl_data_inner_crc,
+      { "Data Frame CRC", "ftnl.data.crc", FT_UINT16, BASE_HEX, NULL, 0x0, NULL, HFILL }
+    },
   };
 
   static gint *ett[] = {&ett_ftnl};
@@ -259,6 +353,7 @@ proto_register_ftnl(void)
      { &ei_ftnl_cmd_unknown, { "ftnl.cmd.unknown", PI_PROTOCOL, PI_WARN, "Unknown command", EXPFILL }},
      { &ei_ftnl_wrong_hdr_crc, { "ftnl.hdrcrc.wrong", PI_PROTOCOL, PI_WARN, "Header CRC wrong", EXPFILL }},
      { &ei_ftnl_wrong_data_crc, { "ftnl.datacrc.wrong", PI_PROTOCOL, PI_WARN, "Data CRC wrong", EXPFILL }},
+     { &ei_ftnl_wrong_inner_data_crc, { "ftnl.data.crc.wrong", PI_PROTOCOL, PI_WARN, "Inner Data CRC wrong", EXPFILL }},
   };
 
   proto_ftnl = proto_register_protocol("Brocade 78xx FCIP Tunnel", "FTNL", "ftnl");
@@ -294,7 +389,7 @@ dissect_ftnl_handle(tvbuff_t *tvb, packet_info *pinfo, proto_tree *tree, void* d
 }
 
 static gboolean
-dissect_ftnl_heur (tvbuff_t *tvb, packet_info *pinfo, proto_tree *tree _U_, void *data _U_)
+dissect_ftnl_heur (tvbuff_t *tvb, packet_info *pinfo, proto_tree *tree, void *data _U_)
 {
   gint bytes_remaining = tvb_captured_length (tvb);
   guint32 marker;
@@ -318,7 +413,7 @@ dissect_ftnl_heur (tvbuff_t *tvb, packet_info *pinfo, proto_tree *tree _U_, void
 }
 
 static int
-dissect_ftnl_bind_req(tvbuff_t *tvb, packet_info *pinfo _U_, proto_tree *tree _U_, void *data _U_)
+dissect_ftnl_bind_req(tvbuff_t *tvb, packet_info *pinfo, proto_tree *tree, void *data _U_)
 {
   proto_item *ti;
   col_append_str(pinfo->cinfo, COL_INFO, "Bind Request");
@@ -331,7 +426,7 @@ dissect_ftnl_bind_req(tvbuff_t *tvb, packet_info *pinfo _U_, proto_tree *tree _U
 }
 
 static int
-dissect_ftnl_bind_resp(tvbuff_t *tvb, packet_info *pinfo _U_, proto_tree *tree _U_, void *data _U_)
+dissect_ftnl_bind_resp(tvbuff_t *tvb, packet_info *pinfo, proto_tree *tree, void *data _U_)
 {
   proto_item *ti;
   col_append_str(pinfo->cinfo, COL_INFO, "Bind Response");
@@ -343,7 +438,7 @@ dissect_ftnl_bind_resp(tvbuff_t *tvb, packet_info *pinfo _U_, proto_tree *tree _
 }
 
 static int
-dissect_ftnl_keepalive(tvbuff_t *tvb, packet_info *pinfo _U_, proto_tree *tree _U_, void *data _U_)
+dissect_ftnl_keepalive(tvbuff_t *tvb, packet_info *pinfo, proto_tree *tree, void *data _U_)
 {
   proto_item *ti;
   col_append_str(pinfo->cinfo, COL_INFO, "Keepalive");
@@ -355,7 +450,7 @@ dissect_ftnl_keepalive(tvbuff_t *tvb, packet_info *pinfo _U_, proto_tree *tree _
 }
 
 static int
-dissect_ftnl_window(tvbuff_t *tvb, packet_info *pinfo _U_, proto_tree *tree _U_, void *data _U_)
+dissect_ftnl_window(tvbuff_t *tvb, packet_info *pinfo, proto_tree *tree, void *data _U_)
 {
   proto_item *ti;
   col_append_str(pinfo->cinfo, COL_INFO, "Window Update");
